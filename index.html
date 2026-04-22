@@ -395,11 +395,24 @@ code {
 .pl-video-wrap { position:relative; background:#000; flex-shrink:0; }
 #pl-video { width:100%; max-height:60vh; display:block; background:#000; }
 
+.pl-status {
+  position:absolute; inset:0; display:none;
+  align-items:center; justify-content:center;
+  flex-direction:column; gap:.6rem; background:rgba(0,0,0,.75);
+  color:var(--muted); font-size:.82rem;
+}
+.pl-status.show { display:flex; }
+.pl-status-spinner {
+  width:28px; height:28px; border:2px solid var(--subtle);
+  border-top-color:var(--accent); border-radius:50%;
+  animation:spin .75s linear infinite;
+}
+
 .pl-err {
   position:absolute; inset:0; display:none;
   align-items:center; justify-content:center;
   flex-direction:column; gap:.4rem; color:var(--muted);
-  font-size:.82rem; background:#000;
+  font-size:.82rem; background:#000; text-align:center; padding:1rem;
 }
 .pl-err-i { font-size:2.2rem; margin-bottom:.2rem; }
 
@@ -520,10 +533,14 @@ code {
     </div>
     <div class="pl-video-wrap">
       <video id="pl-video" controls autoplay playsinline></video>
+      <div class="pl-status" id="pl-status">
+        <div class="pl-status-spinner"></div>
+        <span id="pl-status-txt">Conectando…</span>
+      </div>
       <div class="pl-err" id="pl-err">
         <div class="pl-err-i">📡</div>
-        <strong>Stream indisponível</strong>
-        <span>Verifique se o canal está ativo.</span>
+        <strong id="pl-err-title">Stream indisponível</strong>
+        <span id="pl-err-sub">Este canal pode usar um protocolo não suportado pelo browser (RTMP/RTSP).</span>
       </div>
     </div>
   </div>
@@ -696,35 +713,96 @@ function posterCard(it, i) {
   </div>`;
 }
 
+/* ── Stream com retry CORS ────────────────────────────────── */
+const PROXIES = [
+  u => u,
+  u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+];
+
+let _origUrl = null;
+
 function play(i) {
   const item=filteredItems()[i]; if (!item) return;
   $('pl-title').textContent=item.name;
   $('pl-group').textContent=item.group||'';
   $('player-bg').classList.add('open');
-  $('pl-err').style.display='none';
-  startStream(item.url);
+  _origUrl=item.url;
+  _startStream(item.url, 0);
 }
 
-/* ── Stream ───────────────────────────────────────────────── */
-function startStream(url) {
+function _startStream(origUrl, pIdx) {
   const v=$('pl-video');
   if (hls) { hls.destroy(); hls=null; }
-  v.removeAttribute('src'); v.load(); $('pl-err').style.display='none';
-  const isHLS=/\.m3u8|m3u8/i.test(url);
-  if (isHLS && typeof Hls!=='undefined' && Hls.isSupported()) {
-    hls=new Hls({enableWorker:true});
-    hls.loadSource(url); hls.attachMedia(v);
-    hls.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{}));
-    hls.on(Hls.Events.ERROR,(_,d)=>{ if(d.fatal) $('pl-err').style.display='flex'; });
-  } else { v.src=url; v.play().catch(()=>{}); }
-  v.onerror=()=>{ $('pl-err').style.display='flex'; };
+  v.removeAttribute('src'); v.load();
+  _hidePlErr(); _hidePlStatus();
+
+  // Protocolo incompatível — falha imediata
+  if (/^rtmp|^rtsp/i.test(origUrl)) {
+    _showPlErr('Protocolo não suportado', 'RTMP e RTSP não funcionam em browsers. Use o VLC ou um app nativo.');
+    return;
+  }
+
+  const proxyFn = PROXIES[pIdx];
+  const proxiedUrl = proxyFn(origUrl);
+  const usingProxy = pIdx > 0;
+
+  if (pIdx === 0) {
+    _showPlStatus('Conectando…');
+  } else {
+    _showPlStatus(`Tentando via proxy ${pIdx} de ${PROXIES.length - 1}…`);
+  }
+
+  const isHLS = /m3u8/i.test(origUrl);
+
+  function onFatalError() {
+    const next = pIdx + 1;
+    if (next < PROXIES.length) {
+      _startStream(origUrl, next);
+    } else {
+      _hidePlStatus();
+      _showPlErr('Stream indisponível', 'Nenhum proxy conseguiu conectar. O canal pode estar offline ou bloqueado.');
+    }
+  }
+
+  if (isHLS && typeof Hls !== 'undefined' && Hls.isSupported()) {
+    const cfg = { enableWorker: true };
+    if (usingProxy) {
+      // Redireciona manifest E segmentos pelo mesmo proxy
+      cfg.xhrSetup = (xhr, segUrl) => {
+        xhr.open('GET', proxyFn(segUrl), true);
+      };
+    }
+    hls = new Hls(cfg);
+    hls.loadSource(proxiedUrl);
+    hls.attachMedia(v);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => { _hidePlStatus(); v.play().catch(()=>{}); });
+    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) onFatalError(); });
+  } else {
+    v.src = proxiedUrl;
+    v.play().catch(()=>{});
+    v.addEventListener('playing', _hidePlStatus, { once: true });
+    v.onerror = () => onFatalError();
+  }
 }
+
+function _showPlStatus(msg) {
+  $('pl-status-txt').textContent = msg;
+  $('pl-status').classList.add('show');
+}
+function _hidePlStatus() { $('pl-status').classList.remove('show'); }
+function _showPlErr(title, sub) {
+  $('pl-err-title').textContent = title;
+  $('pl-err-sub').textContent = sub;
+  $('pl-err').style.display = 'flex';
+}
+function _hidePlErr() { $('pl-err').style.display = 'none'; }
 
 function closePl() {
   $('player-bg').classList.remove('open');
   const v=$('pl-video'); v.pause(); v.removeAttribute('src'); v.load();
   if (hls) { hls.destroy(); hls=null; }
-  $('pl-err').style.display='none';
+  _hidePlErr(); _hidePlStatus(); _origUrl=null;
 }
 
 /* ── Tab switch ───────────────────────────────────────────── */
